@@ -1,815 +1,509 @@
-import type { Express, Request, Response } from "express";
+import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
+import multer from "multer";
+import { validateEmails, processEmails } from "./services/emailValidator";
 import { z } from "zod";
-import { spawn } from "child_process";
+import { validateEmailResultSchema } from "@shared/schema";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import fs from "fs";
-import { 
-  loginSchema, 
-  insertUserSchema, 
-  insertCheckSchema,
-  insertLogSchema,
-  insertSettingsSchema 
-} from "@shared/schema";
+import { dirname } from "path";
 
-// Get current directory
+// For ES modules
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname = dirname(__filename);
 
-// Session storage
-type UserSession = {
-  id: number;
-  username: string;
-  role: string;
-};
+// Set up multer for file uploads
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const uploadsDir = path.join(__dirname, "../uploads");
 
-// In-memory session store
-const sessions = new Map<string, UserSession>();
+      // Create directory if it doesn't exist
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+
+      cb(null, uploadsDir);
+    },
+    filename: (req, file, cb) => {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+      cb(null, uniqueSuffix + '-' + file.originalname);
+    }
+  }),
+  limits: {
+    fileSize: 30 * 1024 * 1024, // 30MB
+  },
+  fileFilter: (req, file, cb) => {
+    // Accept only .txt and .csv
+    if (file.mimetype === "text/plain" || file.mimetype === "text/csv" || 
+        file.originalname.endsWith('.txt') || file.originalname.endsWith('.csv')) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only .txt and .csv files are allowed"));
+    }
+  }
+});
+
+// Импортируем p-limit для ограничения параллельных операций
+import pLimit from 'p-limit';
+import { createReadStream } from 'fs';
+import readline from 'readline';
+
+// Global variables for tracking validation progress
+// Тип данных для задачи валидации
+interface ValidationTask {
+  id: string;
+  processed: number;
+  total: number;
+  startTime: number;
+  isValidating: boolean;
+  results: {
+    valid: string[];
+    invalid: { email: string; reason: string }[];
+    stats: {
+      totalProcessed: number;
+      valid: number;
+      invalid: number;
+      processingTime: string;
+      invalidReasons: {
+        syntax: number;
+        spam: number;
+        disposable: number;
+        inactive: number;
+        noMxRecords: number;
+        smtpError: number;
+      }
+    }
+  };
+  clients: Set<any>;
+  // Добавляем флаги для управления памятью
+  batchSize: number;
+  memoryOptimized: boolean;
+}
+
+// Хранилище задач валидации
+const validationTasks = new Map<string, ValidationTask>();
+
+// Функция для создания уникального ID
+function generateTaskId(): string {
+  return Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+}
+
+// Функция для создания новой задачи валидации
+function createValidationTask(): ValidationTask {
+  const taskId = generateTaskId();
+  const task: ValidationTask = {
+    id: taskId,
+    processed: 0,
+    total: 0,
+    startTime: Date.now(),
+    isValidating: true,
+    results: {
+      valid: [],
+      invalid: [],
+      stats: {
+        totalProcessed: 0,
+        valid: 0,
+        invalid: 0,
+        processingTime: '',
+        invalidReasons: {
+          syntax: 0,
+          spam: 0,
+          disposable: 0,
+          inactive: 0,
+          noMxRecords: 0,
+          smtpError: 0
+        }
+      }
+    },
+    clients: new Set(),
+    batchSize: 500, // Размер пакета для обработки
+    memoryOptimized: false // Отключаем оптимизацию памяти для хранения всех адресов
+  };
+
+  validationTasks.set(taskId, task);
+  return task;
+}
+
+// Очистка старых задач (задачи старше 24 часов)
+setInterval(() => {
+  const currentTime = Date.now();
+  const oneDayInMillis = 24 * 60 * 60 * 1000;
+
+  for (const [id, task] of validationTasks.entries()) {
+    if (!task.isValidating && (currentTime - task.startTime) > oneDayInMillis) {
+      validationTasks.delete(id);
+    }
+  }
+}, 60 * 60 * 1000); // Проверка раз в час
 
 export async function registerRoutes(app: Express): Promise<Server> {
-  // Authentication middleware
-  const authenticate = (req: Request, res: Response, next: () => void) => {
-    const sessionId = req.headers.authorization?.split(' ')[1];
-    
-    if (!sessionId || !sessions.has(sessionId)) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
-    
-    const userSession = sessions.get(sessionId);
-    req.user = userSession;
-    next();
-  };
-  
-  // Check admin role middleware
-  const checkAdmin = (req: Request, res: Response, next: () => void) => {
-    if (req.user?.role !== 'admin') {
-      return res.status(403).json({ message: "Access forbidden" });
-    }
-    next();
-  };
-  
-  // AUTHENTICATION ROUTES
-  
-  // Login
-  app.post('/api/auth/login', async (req: Request, res: Response) => {
+  // API routes
+  app.post('/api/validate-emails', upload.single('file'), async (req, res) => {
     try {
-      const credentials = loginSchema.parse(req.body);
-      const user = await storage.getUserByUsername(credentials.username);
-      
-      // Simple password check (in a real app, should use proper hashing)
-      if (!user || user.password !== credentials.password) {
-        return res.status(401).json({ message: "Invalid credentials" });
+      if (!req.file) {
+        return res.status(400).json({ message: "No file uploaded" });
       }
-      
-      // Generate session token
-      const sessionId = Math.random().toString(36).substring(2, 15);
-      const userSession: UserSession = {
-        id: user.id,
-        username: user.username,
-        role: user.role
+
+      // Create a new validation task
+      const task = createValidationTask();
+
+      // Оптимизированный процесс валидации - используем потоковую обработку файла
+      // и контроль количества параллельных задач
+      const filePath = req.file.path;
+      const limit = pLimit(50); // Ограничиваем количество параллельных операций
+
+      // Подсчитываем общее количество адресов в файле
+      const countLines = () => {
+        return new Promise<number>((resolve) => {
+          let lineCount = 0;
+          const readStream = createReadStream(filePath, { encoding: 'utf8' });
+          const rl = readline.createInterface({
+            input: readStream,
+            crlfDelay: Infinity
+          });
+
+          rl.on('line', () => {
+            lineCount++;
+          });
+
+          rl.on('close', () => {
+            resolve(lineCount);
+          });
+        });
       };
-      
-      sessions.set(sessionId, userSession);
-      
-      await storage.createLog({
-        userId: user.id,
-        action: "Login",
-        details: `User ${user.username} logged in${credentials.rememberMe ? ' (with remember me)' : ''}`
-      });
-      
-      return res.status(200).json({
-        token: sessionId,
-        rememberMe: credentials.rememberMe,
-        user: {
-          id: user.id,
-          username: user.username,
-          email: user.email,
-          fullName: user.fullName,
-          role: user.role,
-          apiId: user.apiId,
-          apiHash: user.apiHash,
-          phoneNumber: user.phoneNumber
-        }
-      });
-    } catch (error) {
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({ message: error.errors });
-      }
-      return res.status(500).json({ message: "Internal server error" });
-    }
-  });
-  
-  // Logout
-  app.post('/api/auth/logout', authenticate, async (req: Request, res: Response) => {
-    const sessionId = req.headers.authorization?.split(' ')[1];
-    
-    if (sessionId) {
-      sessions.delete(sessionId);
-    }
-    
-    await storage.createLog({
-      userId: req.user?.id,
-      action: "Logout",
-      details: `User ${req.user?.username} logged out`
-    });
-    
-    return res.status(200).json({ message: "Logged out successfully" });
-  });
-  
-  // Get current user
-  app.get('/api/auth/me', authenticate, async (req: Request, res: Response) => {
-    const user = await storage.getUser(req.user?.id as number);
-    
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-    
-    return res.status(200).json({
-      id: user.id,
-      username: user.username,
-      email: user.email,
-      fullName: user.fullName,
-      role: user.role,
-      apiId: user.apiId,
-      apiHash: user.apiHash,
-      phoneNumber: user.phoneNumber
-    });
-  });
-  
-  // USER ROUTES
-  
-  // Get all users (admin only)
-  app.get('/api/users', authenticate, checkAdmin, async (req: Request, res: Response) => {
-    try {
-      // In a real app, we'd get from DB here
-      // This is a workaround for in-memory storage
-      const allUsers = [];
-      for (let i = 1; i <= 100; i++) {
-        const user = await storage.getUser(i);
-        if (user) {
-          allUsers.push({
-            id: user.id,
-            username: user.username,
-            email: user.email,
-            fullName: user.fullName,
-            role: user.role,
-            status: user.status,
-            createdAt: user.createdAt
+
+      // Запускаем подсчет строк и устанавливаем общее количество
+      countLines().then(total => {
+        task.total = total;
+
+        // Начинаем процесс обработки
+        const processFile = async () => {
+          const readStream = createReadStream(filePath, { encoding: 'utf8' });
+          const rl = readline.createInterface({
+            input: readStream,
+            crlfDelay: Infinity
           });
-        }
-      }
-      
-      return res.status(200).json(allUsers);
-    } catch (error) {
-      return res.status(500).json({ message: "Internal server error" });
-    }
-  });
-  
-  // Create user
-  app.post('/api/users', async (req: Request, res: Response) => {
-    try {
-      const userData = insertUserSchema.parse(req.body);
-      
-      // Check if username or email already exists
-      const existingUser = await storage.getUserByUsername(userData.username);
-      if (existingUser) {
-        return res.status(409).json({ message: "Username already exists" });
-      }
-      
-      const newUser = await storage.createUser(userData);
-      
-      await storage.createLog({
-        userId: newUser.id,
-        action: "Register",
-        details: `New user ${newUser.username} registered`
-      });
-      
-      return res.status(201).json({
-        id: newUser.id,
-        username: newUser.username,
-        email: newUser.email,
-        fullName: newUser.fullName,
-        role: newUser.role
-      });
-    } catch (error) {
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({ message: error.errors });
-      }
-      return res.status(500).json({ message: "Internal server error" });
-    }
-  });
-  
-  // Update user
-  app.put('/api/users/:id', authenticate, async (req: Request, res: Response) => {
-    try {
-      const userId = parseInt(req.params.id);
-      
-      // Only allow users to update their own data unless admin
-      if (req.user?.id !== userId && req.user?.role !== 'admin') {
-        return res.status(403).json({ message: "Access forbidden" });
-      }
-      
-      const user = await storage.getUser(userId);
-      if (!user) {
-        return res.status(404).json({ message: "User not found" });
-      }
-      
-      const updatedUser = await storage.updateUser(userId, req.body);
-      
-      await storage.createLog({
-        userId: req.user?.id,
-        action: "Update User",
-        details: `User ${user.username} updated`
-      });
-      
-      return res.status(200).json({
-        id: updatedUser?.id,
-        username: updatedUser?.username,
-        email: updatedUser?.email,
-        fullName: updatedUser?.fullName,
-        role: updatedUser?.role,
-        apiId: updatedUser?.apiId,
-        apiHash: updatedUser?.apiHash,
-        phoneNumber: updatedUser?.phoneNumber
-      });
-    } catch (error) {
-      return res.status(500).json({ message: "Internal server error" });
-    }
-  });
-  
-  // SETTINGS ROUTES
-  
-  // Get user settings
-  app.get('/api/settings', authenticate, async (req: Request, res: Response) => {
-    try {
-      const userId = req.user?.id as number;
-      let settings = await storage.getSettingsByUserId(userId);
-      
-      if (!settings) {
-        // Create default settings if none exist
-        settings = await storage.createSettings({
-          userId,
-          batchSize: 500,
-          timeout: 30,
-          retries: 3,
-          logAllOperations: true
+
+          const promises = [];
+          const updateInterval = Math.max(1, Math.floor(total / 200)); // Обновление UI примерно 200 раз за весь процесс
+          let lastUpdateTime = Date.now();
+          let batchCount = 0;
+
+          for await (const line of rl) {
+            const email = line.trim();
+            if (!email) continue;
+
+            batchCount++;
+
+            promises.push(
+              limit(async () => {
+                try {
+                  const results = await validateEmails([email]);
+                  const result = results[0];
+
+                  // Обновляем статистику
+                  task.processed++;
+                  task.results.stats.totalProcessed++;
+
+                  if (result.isValid) {
+                    task.results.stats.valid++;
+
+                    // Сохраняем все валидные адреса, отключаем оптимизацию памяти
+                    task.results.valid.push(email);
+                  } else {
+                    task.results.stats.invalid++;
+
+                    // Обновляем счетчики причин
+                    if (result.reason?.includes("Syntax")) {
+                      task.results.stats.invalidReasons.syntax++;
+                    } else if (result.reason?.includes("Spam")) {
+                      task.results.stats.invalidReasons.spam++;
+                    } else if (result.reason?.includes("Disposable")) {
+                      task.results.stats.invalidReasons.disposable++;
+                    } else if (result.reason?.includes("Inactive")) {
+                      task.results.stats.invalidReasons.inactive++;
+                    } else if (result.reason?.includes("MX records")) {
+                      task.results.stats.invalidReasons.noMxRecords++;
+                    } else if (result.reason?.includes("SMTP Verification Failed")) {
+                      task.results.stats.invalidReasons.smtpError++;
+                    }
+
+                    // Сохраняем только первые 1000 невалидных адресов для отображения
+                    if (task.results.invalid.length < 1000) {
+                      task.results.invalid.push({
+                        email,
+                        reason: result.reason || "Unknown error"
+                      });
+                    }
+                  }
+
+                  // Сохраняем результат в хранилище
+                  storage.saveValidationResult({
+                    email,
+                    isValid: result.isValid,
+                    reason: result.reason,
+                    hasMxRecords: result.hasMxRecords,
+                    smtpVerified: result.smtpVerified
+                  });
+
+                  // Обновляем прогресс с подходящим интервалом, чтобы не перегружать клиента
+                  const currentTime = Date.now();
+                  if (batchCount >= task.batchSize || 
+                      task.processed % updateInterval === 0 || 
+                      currentTime - lastUpdateTime > 1000) {
+
+                    batchCount = 0;
+                    lastUpdateTime = currentTime;
+
+                    // Рассчитываем скорость и оставшееся время
+                    const elapsedSeconds = (currentTime - task.startTime) / 1000;
+                    const speed = Math.round(task.processed / (elapsedSeconds || 1));
+                    const remainingCount = task.total - task.processed;
+                    const remainingTime = speed > 0 ? remainingCount / speed : 0;
+
+                    // Отправляем обновление всем подключенным клиентам
+                    task.clients.forEach(client => {
+                      try {
+                        client.write(`data: ${JSON.stringify({
+                          type: "progress",
+                          taskId: task.id,
+                          processed: task.processed,
+                          total: task.total,
+                          speed,
+                          remainingTime
+                        })}\n\n`);
+                      } catch (err) {
+                        console.error("Error sending to client:", err);
+                        task.clients.delete(client);
+                      }
+                    });
+                  }
+                } catch (err) {
+                  console.error(`Error processing email ${email}:`, err);
+                }
+              })
+            );
+
+            // Периодически ждем выполнения части промисов, чтобы контролировать использование памяти
+            if (promises.length >= 500) {
+              await Promise.all(promises);
+              promises.length = 0;
+            }
+          }
+
+          // Ждем выполнения оставшихся промисов
+          await Promise.all(promises);
+
+          // Завершение процесса
+          const elapsedSeconds = (Date.now() - task.startTime) / 1000;
+          let processingTime;
+
+          if (elapsedSeconds > 60) {
+            const minutes = Math.floor(elapsedSeconds / 60);
+            const seconds = Math.floor(elapsedSeconds % 60);
+            processingTime = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+          } else {
+            processingTime = `${Math.round(elapsedSeconds)} sec`;
+          }
+
+          // Обновляем статус валидации
+          task.isValidating = false;
+          task.results.stats.processingTime = processingTime;
+
+          // Сохраняем результат
+          validationTasks.set(task.id, task);
+
+          // Уведомляем всех клиентов о завершении
+          task.clients.forEach(client => {
+            try {
+              client.write(`data: ${JSON.stringify({
+                type: "complete",
+                taskId: task.id,
+                stats: task.results.stats,
+                validEmails: task.results.valid,
+                invalidCount: task.results.invalid.length,
+                invalidEmails: task.results.invalid.slice(0, 100)
+              })}\n\n`);
+
+              // Закрываем соединение
+              client.end();
+            } catch (err) {
+              console.error("Error sending completion to client:", err);
+            }
+          });
+
+          // Очищаем набор клиентов
+          task.clients.clear();
+
+          // Удаляем загруженный файл
+          fs.unlink(filePath, (err) => {
+            if (err) console.error("Error deleting file:", err);
+          });
+
+          console.log(`Validation task ${task.id} completed. Processed ${task.processed} emails.`);
+        };
+
+        // Запускаем процесс обработки
+        processFile().catch(err => {
+          console.error("Error in file processing:", err);
+          task.isValidating = false;
+
+          // Уведомляем клиентов об ошибке
+          task.clients.forEach(client => {
+            try {
+              client.write(`data: ${JSON.stringify({
+                type: "error",
+                taskId: task.id,
+                message: "Error processing file"
+              })}\n\n`);
+
+              client.end();
+            } catch (error) {
+              console.error("Error sending error to client:", error);
+            }
+          });
         });
-      }
-      
-      return res.status(200).json(settings);
-    } catch (error) {
-      return res.status(500).json({ message: "Internal server error" });
-    }
-  });
-  
-  // Update user settings
-  app.put('/api/settings', authenticate, async (req: Request, res: Response) => {
-    try {
-      const userId = req.user?.id as number;
-      const settingsData = insertSettingsSchema.partial().parse(req.body);
-      
-      // Ensure batch size doesn't exceed 500
-      if (settingsData.batchSize && settingsData.batchSize > 500) {
-        settingsData.batchSize = 500;
-      }
-      
-      let settings = await storage.getSettingsByUserId(userId);
-      
-      if (!settings) {
-        // Create new settings if none exist
-        settings = await storage.createSettings({
-          userId,
-          ...settingsData
-        });
-      } else {
-        // Update existing settings
-        settings = await storage.updateSettings(settings.id, settingsData) as Settings;
-      }
-      
-      await storage.createLog({
-        userId,
-        action: "Update Settings",
-        details: `User ${req.user?.username} updated settings`
       });
-      
-      return res.status(200).json(settings);
-    } catch (error) {
-      if (error instanceof z.ZodError) {
-        return res.status(400).json({ message: error.errors });
-      }
-      return res.status(500).json({ message: "Internal server error" });
-    }
-  });
-  
-  // CHECK ROUTES
-  
-  // Continue check after authentication
-  app.post('/api/checks/:id/continue', authenticate, async (req: Request, res: Response) => {
-    try {
-      const checkId = parseInt(req.params.id);
-      const check = await storage.getCheck(checkId);
-      
-      if (!check) {
-        return res.status(404).json({ message: "Check not found" });
-      }
-      
-      // Only allow users to continue their own checks unless admin
-      if (check.userId !== req.user?.id && req.user?.role !== 'admin') {
-        return res.status(403).json({ message: "Access forbidden" });
-      }
-      
-      // Get user Telegram API settings
-      const user = await storage.getUser(req.user?.id as number);
-      if (!user || !user.apiId || !user.apiHash || !user.phoneNumber) {
-        return res.status(400).json({ message: "Missing API settings" });
-      }
-      
-      // TODO: In a real implementation, continue with the check process
-      // This would use the existing check data and pick up where it left off
-      
-      // For now, we'll just update the check status
-      await storage.updateCheck(checkId, {
-        status: 'completed',
-        completedAt: new Date()
-      });
-      
-      await storage.createLog({
-        userId: req.user?.id,
-        checkId,
-        action: "Continue Check",
-        details: "Check continued after authentication"
-      });
-      
-      return res.status(200).json({
-        message: "Check continued successfully",
-        checkId,
-        totalNumbers: check.totalNumbers,
-        foundNumbers: check.foundNumbers
+
+      // Возвращаем ID задачи клиенту
+      res.status(200).json({ 
+        message: "Validation started", 
+        taskId: task.id 
       });
     } catch (error) {
-      console.error("Error continuing check:", error);
-      return res.status(500).json({ message: "Error continuing check" });
+      console.error("Error in /validate-emails:", error);
+      res.status(500).json({ message: "Server error during validation" });
     }
   });
-  
-  // Upload file and create check
-  app.post('/api/checks', authenticate, async (req: Request, res: Response) => {
+
+  // SSE endpoint for progress updates с task ID
+  app.get('/api/validation-progress/:taskId', (req, res) => {
+    const taskId = req.params.taskId;
+    const task = validationTasks.get(taskId);
+
+    if (!task) {
+      return res.status(404).json({ message: "Task not found" });
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    // Add client to set of connected clients
+    task.clients.add(res);
+
+    // Send initial progress data
+    const elapsedSeconds = (Date.now() - task.startTime) / 1000;
+    const speed = Math.round(task.processed / (elapsedSeconds || 1));
+    const remainingCount = task.total - task.processed;
+    const remainingTime = speed > 0 ? remainingCount / speed : 0;
+
+    res.write(`data: ${JSON.stringify({
+      type: "progress",
+      taskId: task.id,
+      processed: task.processed,
+      total: task.total,
+      speed,
+      remainingTime
+    })}\n\n`);
+
+    // If validation is already complete, send completion event
+    if (!task.isValidating && task.total > 0) {
+      res.write(`data: ${JSON.stringify({
+        type: "complete",
+        taskId: task.id,
+        stats: task.results.stats,
+        validEmails: task.results.valid,
+        invalidCount: task.results.invalid.length,
+        invalidEmails: task.results.invalid.slice(0, 100)
+      })}\n\n`);
+
+      res.end();
+    }
+
+    // Handle client disconnect
+    req.on('close', () => {
+      task.clients.delete(res);
+    });
+  });
+
+  // Получение статуса задачи
+  app.get('/api/validation-status/:taskId', (req, res) => {
+    const taskId = req.params.taskId;
+    const task = validationTasks.get(taskId);
+
+    if (!task) {
+      return res.status(404).json({ message: "Task not found" });
+    }
+
+    // Формирование ответа со статусом задачи без ограничения на адреса
+    const status = {
+      id: task.id,
+      isValidating: task.isValidating,
+      processed: task.processed,
+      total: task.total,
+      progress: task.total > 0 ? Math.round((task.processed / task.total) * 100) : 0,
+      startTime: task.startTime,
+      stats: task.results.stats,
+      validEmails: task.results.valid, // Добавим все валидные адреса
+      invalidEmails: task.results.invalid.slice(0, 100) // Ограничиваем только невалидные
+    };
+
+    res.json(status);
+  });
+
+  // Получение всех активных задач
+  app.get('/api/validation-tasks', (req, res) => {
+    const tasks = [];
+
+    for (const [id, task] of validationTasks.entries()) {
+      tasks.push({
+        id,
+        isValidating: task.isValidating,
+        processed: task.processed,
+        total: task.total,
+        progress: task.total > 0 ? Math.round((task.processed / task.total) * 100) : 0,
+        startTime: task.startTime,
+        elapsedTime: Date.now() - task.startTime
+      });
+    }
+
+    res.json({ tasks });
+  });
+
+  // Endpoint to get single email validation result
+  app.post('/api/validate-email', async (req, res) => {
     try {
-      const userId = req.user?.id as number;
-      const { fileName, numbers } = req.body;
-      
-      if (!Array.isArray(numbers) || numbers.length === 0) {
-        return res.status(400).json({ message: "Invalid phone numbers" });
-      }
-      
-      // Create new check
-      const check = await storage.createCheck({
-        userId,
-        fileName,
-        totalNumbers: numbers.length,
-        status: 'pending'
+      // Validate input
+      const emailSchema = z.object({
+        email: z.string().email(),
       });
-      
-      await storage.createLog({
-        userId,
-        checkId: check.id,
-        action: "Create Check",
-        details: `User ${req.user?.username} created check with ${numbers.length} phone numbers`
-      });
-      
-      // Get user Telegram API settings
-      const user = await storage.getUser(userId);
-      if (!user || !user.apiId || !user.apiHash || !user.phoneNumber) {
-        await storage.updateCheck(check.id, {
-          status: 'failed'
-        });
-        
+
+      const result = emailSchema.safeParse(req.body);
+
+      if (!result.success) {
         return res.status(400).json({ 
-          message: "Missing Telegram API settings. Please update your API settings.",
-          checkId: check.id
+          message: "Invalid request format",
+          errors: result.error.errors
         });
       }
-      
-      // Check if we need Telegram authentication
-      const sessionName = `user_${userId}`;
-      const sessionFile = path.join(process.cwd(), `${sessionName}.session`);
-      const needsAuth = !fs.existsSync(sessionFile);
-      
-      if (needsAuth) {
-        // Return early with telegramAuth flag
-        return res.status(200).json({
-          message: "Telegram authentication required",
-          checkId: check.id,
-          telegramAuth: true
-        });
-      }
-      
-      // Get user settings for batch size
-      const settings = await storage.getSettingsByUserId(userId);
-      const batchSize = settings?.batchSize || 500;
-      
-      // Update check status to in_progress
-      await storage.updateCheck(check.id, {
-        status: 'in_progress'
-      });
-      
-      // Split numbers into batches
-      const batches = [];
-      for (let i = 0; i < numbers.length; i += batchSize) {
-        batches.push(numbers.slice(i, i + batchSize));
-      }
-      
-      // Process batches sequentially
-      let foundCount = 0;
-      
-      for (let i = 0; i < batches.length; i++) {
-        const batch = batches[i];
-        
-        try {
-          // Call Python script to check numbers
-          const results = await checkTelegramAccounts(
-            batch,
-            user.apiId,
-            user.apiHash,
-            user.phoneNumber,
-            settings?.timeout || 30
-          );
-          
-          // Store results
-          const resultsToInsert = results.map(result => ({
-            checkId: check.id,
-            phoneNumber: result.phoneNumber,
-            found: result.found,
-            telegramId: result.telegramId || null,
-            username: result.username || null,
-            name: result.name || null
-          }));
-          
-          await storage.createResults(resultsToInsert);
-          
-          // Update found count
-          foundCount += results.filter(r => r.found).length;
-          
-          // Update check progress
-          await storage.updateCheck(check.id, {
-            foundNumbers: foundCount
-          });
-          
-          await storage.createLog({
-            userId,
-            checkId: check.id,
-            action: "Process Batch",
-            details: `Processed batch ${i + 1}/${batches.length} with ${results.filter(r => r.found).length} found accounts`
-          });
-        } catch (error) {
-          console.error("Error processing batch:", error);
-          
-          await storage.createLog({
-            userId,
-            checkId: check.id,
-            action: "Process Batch Error",
-            details: `Error processing batch ${i + 1}/${batches.length}: ${error}`
-          });
-        }
-      }
-      
-      // Update check status to completed
-      await storage.updateCheck(check.id, {
-        status: 'completed',
-        foundNumbers: foundCount,
-        completedAt: new Date()
-      });
-      
-      await storage.createLog({
-        userId,
-        checkId: check.id,
-        action: "Complete Check",
-        details: `Check completed with ${foundCount} found accounts out of ${numbers.length} total`
-      });
-      
-      return res.status(200).json({ 
-        message: "Check completed successfully", 
-        checkId: check.id,
-        totalNumbers: numbers.length,
-        foundNumbers: foundCount
-      });
+
+      const { email } = result.data;
+
+      // Validate the email
+      const validationResult = await validateEmails([email]);
+
+      // Return the result
+      res.status(200).json(validationResult[0]);
     } catch (error) {
-      console.error("Error during check:", error);
-      return res.status(500).json({ message: "Error processing phone numbers" });
-    }
-  });
-  
-  // Get all checks for user
-  app.get('/api/checks', authenticate, async (req: Request, res: Response) => {
-    try {
-      const userId = req.user?.id as number;
-      const checks = await storage.getChecksByUserId(userId);
-      
-      return res.status(200).json(checks);
-    } catch (error) {
-      return res.status(500).json({ message: "Internal server error" });
-    }
-  });
-  
-  // Get specific check
-  app.get('/api/checks/:id', authenticate, async (req: Request, res: Response) => {
-    try {
-      const checkId = parseInt(req.params.id);
-      const check = await storage.getCheck(checkId);
-      
-      if (!check) {
-        return res.status(404).json({ message: "Check not found" });
-      }
-      
-      // Only allow users to view their own checks unless admin
-      if (check.userId !== req.user?.id && req.user?.role !== 'admin') {
-        return res.status(403).json({ message: "Access forbidden" });
-      }
-      
-      return res.status(200).json(check);
-    } catch (error) {
-      return res.status(500).json({ message: "Internal server error" });
-    }
-  });
-  
-  // Delete check
-  app.delete('/api/checks/:id', authenticate, async (req: Request, res: Response) => {
-    try {
-      const checkId = parseInt(req.params.id);
-      const check = await storage.getCheck(checkId);
-      
-      if (!check) {
-        return res.status(404).json({ message: "Check not found" });
-      }
-      
-      // Only allow users to delete their own checks unless admin
-      if (check.userId !== req.user?.id && req.user?.role !== 'admin') {
-        return res.status(403).json({ message: "Access forbidden" });
-      }
-      
-      await storage.deleteCheck(checkId);
-      
-      await storage.createLog({
-        userId: req.user?.id,
-        action: "Delete Check",
-        details: `Check #${checkId} deleted`
-      });
-      
-      return res.status(200).json({ message: "Check deleted successfully" });
-    } catch (error) {
-      return res.status(500).json({ message: "Internal server error" });
-    }
-  });
-  
-  // RESULTS ROUTES
-  
-  // Get results for a specific check
-  app.get('/api/checks/:id/results', authenticate, async (req: Request, res: Response) => {
-    try {
-      const checkId = parseInt(req.params.id);
-      const check = await storage.getCheck(checkId);
-      
-      if (!check) {
-        return res.status(404).json({ message: "Check not found" });
-      }
-      
-      // Only allow users to view their own results unless admin
-      if (check.userId !== req.user?.id && req.user?.role !== 'admin') {
-        return res.status(403).json({ message: "Access forbidden" });
-      }
-      
-      const results = await storage.getResultsByCheckId(checkId);
-      
-      return res.status(200).json(results);
-    } catch (error) {
-      return res.status(500).json({ message: "Internal server error" });
-    }
-  });
-  
-  // LOGS ROUTES
-  
-  // Get all logs (admin only)
-  app.get('/api/logs', authenticate, checkAdmin, async (req: Request, res: Response) => {
-    try {
-      const logs = await storage.getLogs();
-      return res.status(200).json(logs);
-    } catch (error) {
-      return res.status(500).json({ message: "Internal server error" });
-    }
-  });
-  
-  // Get logs for current user
-  app.get('/api/my-logs', authenticate, async (req: Request, res: Response) => {
-    try {
-      const userId = req.user?.id as number;
-      const logs = await storage.getLogsByUserId(userId);
-      return res.status(200).json(logs);
-    } catch (error) {
-      return res.status(500).json({ message: "Internal server error" });
-    }
-  });
-  
-  // TELEGRAM AUTH ROUTES
-  
-  // Check Telegram auth status
-  app.get('/api/telegram/auth/status', authenticate, async (req: Request, res: Response) => {
-    try {
-      const userId = req.user?.id as number;
-      const user = await storage.getUser(userId);
-      
-      if (!user) {
-        return res.status(404).json({ message: "User not found" });
-      }
-      
-      if (!user.apiId || !user.apiHash || !user.phoneNumber) {
-        return res.status(400).json({ message: "Missing Telegram API settings" });
-      }
-      
-      // Check if the session file exists
-      const sessionName = `user_${userId}`;
-      const sessionFile = path.join(process.cwd(), `${sessionName}.session`);
-      
-      const sessionExists = fs.existsSync(sessionFile);
-      
-      return res.status(200).json({
-        authenticated: sessionExists,
-        phone: user.phoneNumber
-      });
-    } catch (error) {
-      console.error("Error checking Telegram auth status:", error);
-      return res.status(500).json({ message: "Internal server error" });
-    }
-  });
-  
-  // Submit Telegram auth code
-  app.post('/api/telegram/auth', authenticate, async (req: Request, res: Response) => {
-    try {
-      const userId = req.user?.id as number;
-      const { code } = req.body;
-      
-      if (!code) {
-        return res.status(400).json({ message: "Auth code is required" });
-      }
-      
-      const user = await storage.getUser(userId);
-      
-      if (!user || !user.apiId || !user.apiHash || !user.phoneNumber) {
-        return res.status(400).json({ message: "Missing Telegram API settings" });
-      }
-      
-      // Call Python script to authenticate
-      const sessionName = `user_${userId}`;
-      
-      try {
-        await authenticateTelegram(
-          user.apiId,
-          user.apiHash,
-          user.phoneNumber,
-          code,
-          sessionName
-        );
-        
-        await storage.createLog({
-          userId,
-          action: "Telegram Authentication",
-          details: "User authenticated with Telegram"
-        });
-        
-        return res.status(200).json({ success: true });
-      } catch (error: any) {
-        console.error("Telegram auth error:", error);
-        
-        await storage.createLog({
-          userId,
-          action: "Telegram Authentication Error",
-          details: `Auth error: ${error.message}`
-        });
-        
-        return res.status(400).json({ message: error.message });
-      }
-    } catch (error) {
-      console.error("Error in Telegram auth:", error);
-      return res.status(500).json({ message: "Internal server error" });
+      console.error("Error in /validate-email:", error);
+      res.status(500).json({ message: "Server error during validation" });
     }
   });
 
   const httpServer = createServer(app);
   return httpServer;
-}
-
-// Function to authenticate with Telegram
-async function authenticateTelegram(
-  apiId: string,
-  apiHash: string,
-  phoneNumber: string,
-  code: string,
-  sessionName: string
-): Promise<boolean> {
-  return new Promise((resolve, reject) => {
-    // Path to Python script
-    const scriptPath = path.join(__dirname, 'pythonScripts', 'telegram_auth.py');
-    
-    // Create a Python process
-    const pythonProcess = spawn('python3', [
-      scriptPath,
-      '--api-id', apiId,
-      '--api-hash', apiHash,
-      '--phone', phoneNumber,
-      '--code', code,
-      '--session', sessionName
-    ]);
-    
-    let outputData = '';
-    let errorData = '';
-    
-    pythonProcess.stdout.on('data', (data) => {
-      outputData += data.toString();
-    });
-    
-    pythonProcess.stderr.on('data', (data) => {
-      errorData += data.toString();
-    });
-    
-    pythonProcess.on('close', (code) => {
-      if (code !== 0) {
-        console.error('Python authentication process exited with code', code);
-        console.error('Error:', errorData);
-        return reject(new Error(`Authentication failed: ${errorData}`));
-      }
-      
-      try {
-        const result = JSON.parse(outputData);
-        if (result.success) {
-          resolve(true);
-        } else {
-          reject(new Error(result.error || "Authentication failed"));
-        }
-      } catch (error) {
-        reject(new Error(`Failed to parse Python script output`));
-      }
-    });
-  });
-}
-
-// Function to check Telegram accounts using Python script
-async function checkTelegramAccounts(
-  phoneNumbers: string[],
-  apiId: string,
-  apiHash: string,
-  phoneNumber: string,
-  timeout: number = 30
-): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    // Create a file to store the numbers
-    const tempFile = path.join(__dirname, `temp_${Date.now()}.json`);
-    fs.writeFileSync(tempFile, JSON.stringify(phoneNumbers));
-    
-    // Path to Python script
-    const scriptPath = path.join(__dirname, 'pythonScripts', 'telegram_checker.py');
-    
-    // Create a Python process
-    const pythonProcess = spawn('python3', [
-      scriptPath,
-      '--api-id', apiId,
-      '--api-hash', apiHash,
-      '--phone', phoneNumber,
-      '--input-file', tempFile,
-      '--timeout', timeout.toString()
-    ]);
-    
-    let outputData = '';
-    let errorData = '';
-    
-    pythonProcess.stdout.on('data', (data) => {
-      outputData += data.toString();
-    });
-    
-    pythonProcess.stderr.on('data', (data) => {
-      errorData += data.toString();
-    });
-    
-    pythonProcess.on('close', (code) => {
-      // Clean up the temp file
-      try {
-        fs.unlinkSync(tempFile);
-      } catch (err) {
-        console.error('Error deleting temp file:', err);
-      }
-      
-      if (code !== 0) {
-        console.error('Python process exited with code', code);
-        console.error('Error:', errorData);
-        return reject(new Error(`Python script exited with code ${code}: ${errorData}`));
-      }
-      
-      try {
-        const results = JSON.parse(outputData);
-        resolve(results);
-      } catch (error) {
-        reject(new Error(`Failed to parse Python script output: ${error}`));
-      }
-    });
-  });
 }
